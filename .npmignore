@@ -2,3 +2,8 @@ mock-lib
 src
 test
 static
+lib
+node_modules
+*.log
+*.lock
+.idea/

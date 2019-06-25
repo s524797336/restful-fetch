@@ -28,6 +28,13 @@ const methods = {
 };
 methods.remove = methods.delete;
 
+const decode = (ui8) => {
+  if (TextDecoder) {
+    return new TextDecoder('utf-8').decode(ui8);
+  }
+  return String.fromCharCode(...ui8);
+}
+
 export default function Restful(options) {
   if (!(this instanceof Restful)) return new Restful(options);
   options = this.options = Object.assign({}, options);
@@ -54,19 +61,62 @@ export default function Restful(options) {
   ];
   this.posthandlers = [
     // parse payload
-    res => Promise.resolve()
-    .then(() => {
-      if (res.status === 204) return {};
-      const contentType = res.headers.get('content-type');
-      if (/application\/json/.test(contentType)) {
-        return res.json();
-      } else if (/text\//.test(contentType)) {
-        return res.text();
-      } else {
-        return res.blob();
-      }
-    })
-    .then(data => ({res, data})),
+    (res, request) => Promise.resolve()
+      .then(() => {
+        if (res.status === 204) return {};
+        const contentType = res.headers.get('content-type');
+        if (/application\/json/.test(contentType)) {
+          return res.json();
+        } else if (/text\//.test(contentType)) {
+          return res.text();
+        } else if (/application\/octet-stream/.test(contentType) && res.headers.get('content-length')) {
+          const total = parseInt(res.headers.get('content-length'));
+          let charsReceived = 0;
+          let result = '';
+          if (res.body.getReader) {
+            const reader = res.body.getReader();
+            return new Promise((resolve, reject) => {
+              reader.read().then(function processText({ done, value }) {
+                // Result objects contain two properties:
+                // done  - true if the stream has already given you all its data.
+                // value - some data. Always undefined when done is true.
+
+                // value for fetch streams is a Uint8Array
+
+                if (done) {
+                  resolve(result);
+                  return;
+                }
+
+                charsReceived += value.length;
+                request.onProgress && request.onProgress(charsReceived, total);
+
+                result += decode(value);
+
+                // Read some more, and call this function again
+                return reader.read().then(processText);
+              }).catch(reject);
+            });
+          }
+
+          return new Promise((resolve, reject) => {
+            res.body.on('data', (value) => {
+              charsReceived += value.length;
+              request.onProgress && request.onProgress(charsReceived, total);
+              result += value;
+            });
+            res.body.on('end', () => {
+              resolve(result);
+            });
+            res.body.on('error', (err) => {
+              reject(err);
+            });
+          });
+        } else {
+          return res.blob();
+        }
+      })
+      .then(data => ({res, data})),
     // return data
     ({res, data}) => {
       // res.ok is not supported in QQBrowser
@@ -82,21 +132,23 @@ export default function Restful(options) {
   [
     'model',
   ]
-  .concat(Object.keys(options.methods))
-  .forEach(method => {
-    this[method] = root[method].bind(root);
-  });
+    .concat(Object.keys(options.methods))
+    .forEach(method => {
+      this[method] = root[method].bind(root);
+    });
 }
 
 Object.assign(Restful.prototype, {
   _prepareRequest(options, overrides) {
-    const {method, url, params, body, headers} = options;
+    const {method, url, params, body, signal, headers, onProgress} = options;
     const request = {
       url,
       method,
       params,
       body,
+      signal,
       headers: Object.assign({}, this.options.headers, headers),
+      onProgress,
     };
     return processHandlers(
       overrides && overrides.prehandlers || this.prehandlers, request,
@@ -105,23 +157,23 @@ Object.assign(Restful.prototype, {
   },
 
   _fetch(request) {
-    const init = ['method', 'headers', 'body']
-    .reduce((init, key) => {
-      const val = request[key];
-      if (val != null) init[key] = val;
-      return init;
-    }, Object.assign({}, this.options.config));
+    const init = ['method', 'headers', 'body', 'signal', 'onProgress']
+      .reduce((init, key) => {
+        const val = request[key];
+        if (val != null) init[key] = val;
+        return init;
+      }, Object.assign({}, this.options.config));
     const url = request.url + toQueryString(request.params);
     return fetch(url, init);
   },
 
   _request(options, overrides) {
     return this._prepareRequest(options, overrides)
-    .then(request => (
-      this._fetch(request)
-      .then(res => processHandlers(overrides && overrides.posthandlers || this.posthandlers, res, request))
-    ))
-    .catch(res => processHandlers(overrides && overrides.errhandlers || this.errhandlers, res));
+      .then(request => (
+        this._fetch(request)
+          .then(res => processHandlers(overrides && overrides.posthandlers || this.posthandlers, res, request))
+      ))
+      .catch(res => processHandlers(overrides && overrides.errhandlers || this.errhandlers, res));
   },
 });
 
@@ -144,18 +196,18 @@ Object.assign(Model.prototype, {
   _setPath(path) {
     if (path) {
       path = path.replace(RE_SLASHES, '')
-      .split('/')
-      .filter(c => c)
-      .map(comp => {
-        if (!comp) {
-          throw new Error('Invalid path!');
-        }
-        if (comp[0] === ':') {
-          this._addParam(comp.slice(1));
-        }
-        return comp;
-      })
-      .join('/');
+        .split('/')
+        .filter(c => c)
+        .map(comp => {
+          if (!comp) {
+            throw new Error('Invalid path!');
+          }
+          if (comp[0] === ':') {
+            this._addParam(comp.slice(1));
+          }
+          return comp;
+        })
+        .join('/');
       if (path) path = '/' + path;
     }
     this.path = path || '';
@@ -219,7 +271,7 @@ Object.assign(Model.prototype, {
       }
       options.url = url;
       return this.restful._request(options, this.overrides)
-      .then(res => processHandlers(this.posthandlers, res, options));
+        .then(res => processHandlers(this.posthandlers, res, options));
     });
   },
 });
